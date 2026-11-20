@@ -1,0 +1,21 @@
+# Secrets and per-user records: never commit these.
+watermark.key
+manifest.json
+manifest.json.*
+*.json.tmp
+
+# Images you watermark or check
+published/
+out/
+*.png
+*.jpg
+*.jpeg
+*.webp
+*.tif
+*.tiff
+*.bmp
+
+# Python
+.venv/
+__pycache__/
+*.pyc

@@ -3,6 +3,9 @@ watermark.key
 manifest.json
 manifest.json.*
 *.json.tmp
+.*.tmp
+.watermark.lock
+archive/
 
 # Images you watermark or check
 published/

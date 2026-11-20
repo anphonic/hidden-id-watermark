@@ -32,6 +32,7 @@ or in the folder named by the WATERMARK_DIR environment variable:
     archive/        published copies that --force replaced.
 """
 import argparse
+import collections
 import contextlib
 import datetime
 import hashlib
@@ -40,6 +41,7 @@ import math
 import os
 import secrets
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -67,6 +69,7 @@ LIKELY_CHANCE = 1e-3   # ... and a chance bound no larger than this
 MIN_SIDE = 256         # smaller images do not hold the ID reliably
 ALIGN_MIN_SCORE = 0.45 # crop re-alignment correlation gate (heuristic, not calibrated)
 FLAT_STD = 2.0         # a suspect this flat has nothing to align on
+REF_CACHE_IMAGES = 4   # decoded published copies kept in memory during check
 IMAGE_EXT = {".png", ".jpg", ".jpeg", ".webp", ".tif", ".tiff", ".bmp"}
 BROAD_PRINCIPALS = ("everyone", "builtin\\users", "authenticated users")
 FONT_CANDIDATES = (
@@ -144,24 +147,54 @@ def replace_file(src, dst):
 
 
 def write_private_file(path, text, restrict=False):
-    """Write text to path atomically: unique temp file, fsync, then replace."""
+    """Write text to path atomically: unique temp file, fsync, then replace.
+
+    With restrict, the temp file is locked down to the current user while it is
+    still empty, and nothing is written if that fails.
+    """
     fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.", suffix=".tmp")
     try:
-        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as f:
+        if restrict:
+            os.close(fd)
+            fd = None
+            restrict_to_owner(tmp)               # raises if it cannot
+            f = open(tmp, "w", encoding="utf-8", newline="\n")
+        else:
+            f = os.fdopen(fd, "w", encoding="utf-8", newline="\n")
+            fd = None
+        with f:
             f.write(text)
             f.flush()
             os.fsync(f.fileno())
-        if restrict:
-            restrict_to_owner(tmp)
         replace_file(tmp, path)
     finally:
+        if fd is not None:
+            os.close(fd)
         if os.path.exists(tmp):
             os.unlink(tmp)
 
 
+def public_file_mode(tmp, dst):
+    """Give a temp file the permissions a normal new file would get (POSIX).
+
+    mkstemp makes files owner-only. A published image must stay readable by a
+    web server or other accounts, so keep the mode of the copy being replaced,
+    or else use the usual new-file mode (0666 minus the umask).
+    """
+    if os.name == "nt":
+        return                                   # ACLs are inherited from the folder
+    try:
+        mode = stat.S_IMODE(os.stat(dst).st_mode)
+    except FileNotFoundError:
+        umask = os.umask(0)
+        os.umask(umask)
+        mode = 0o666 & ~umask
+    os.chmod(tmp, mode)
+
+
 # ----------------------------------------------------------------- key
 def restrict_to_owner(path):
-    """Make path readable by the current user only."""
+    """Make path readable by the current user only. Raises OSError if it cannot."""
     if os.name != "nt":
         os.chmod(path, 0o600)
         return
@@ -169,9 +202,8 @@ def restrict_to_owner(path):
         user = subprocess.run(["whoami"], capture_output=True, text=True, check=True).stdout.strip()
         subprocess.run(["icacls", str(path), "/inheritance:r", "/grant:r", f"{user}:F"],
                        capture_output=True, text=True, check=True)
-    except (OSError, subprocess.CalledProcessError) as exc:
-        print(f"WARNING: could not restrict {path} to your account ({exc}). "
-              "Remove other users' access to it by hand.", file=sys.stderr)
+    except subprocess.CalledProcessError as exc:
+        raise OSError(f"icacls failed: {(exc.stderr or exc.stdout or '').strip()}") from exc
 
 
 def warn_if_key_exposed(path):
@@ -197,8 +229,11 @@ def load_key(create):
             sys.exit(f"No key file at {kf}. Nothing has been watermarked with this tool yet.")
         with state_lock():
             if not kf.exists():          # another run may have made it while we waited
-                write_private_file(kf, f"password_img={secrets.randbelow(2**31 - 2) + 1}\n"
-                                       f"password_wm={secrets.randbelow(2**31 - 2) + 1}\n", restrict=True)
+                try:
+                    write_private_file(kf, f"password_img={secrets.randbelow(2**31 - 2) + 1}\n"
+                                           f"password_wm={secrets.randbelow(2**31 - 2) + 1}\n", restrict=True)
+                except OSError as exc:
+                    sys.exit(f"Could not create {kf} readable only by you ({exc}). No key was written.")
                 print(f"Created new secret key: {kf}  (back this file up)")
     warn_if_key_exposed(kf)
     values = {}
@@ -546,22 +581,38 @@ def verify_written(path, hex_id, key, alpha):
     return True, agree, msgs
 
 
+def unused_path(path):
+    """path, or path with -1, -2, ... added before the suffix, whichever does not exist yet."""
+    n = 1
+    candidate = path
+    while candidate.exists():
+        candidate = path.with_name(f"{path.stem}-{n}{path.suffix}")
+        n += 1
+    return candidate
+
+
 def archive_replaced(dst, entries, new_id):
-    """Keep the copy at dst that is about to be replaced. Call with state_lock() held."""
-    live = [e for e in entries if e.get("output") == str(dst) and not e.get("superseded")]
+    """Copy the file at dst into archive/ before it is replaced.
+
+    Returns (archive path, updated copy of entries); entries itself is not
+    changed, so nothing is lost if the commit fails later. The archive name is
+    never reused: two copies can't overwrite each other there. Call with
+    state_lock() held.
+    """
+    live = [i for i, e in enumerate(entries) if e.get("output") == str(dst) and not e.get("superseded")]
     archive_dir().mkdir(parents=True, exist_ok=True)
     if live:
-        target = archive_dir() / (live[-1]["id"] + dst.suffix.lower())
+        base = archive_dir() / (entries[live[-1]]["id"] + dst.suffix.lower())
     else:
         stamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-        target = archive_dir() / f"untracked-{stamp}-{dst.name}"
+        base = archive_dir() / f"untracked-{stamp}-{dst.name}"
+    target = unused_path(base)
     shutil.copy2(dst, target)
     when = now_utc()
-    for e in live:
-        e["output"] = str(target)
-        e["superseded"] = when
-        e["superseded_by"] = new_id
-    return target
+    updated = [dict(e) for e in entries]
+    for i in live:
+        updated[i].update(output=str(target), superseded=when, superseded_by=new_id)
+    return target, updated
 
 
 def cmd_embed(args):
@@ -628,27 +679,53 @@ def cmd_embed(args):
                     failures += 1
                     print(f"FAIL  {src.name}: id {hex_id} was taken by another run meanwhile; try again")
                     continue
+                if dst.exists() and not args.force:
+                    print(f"SKIP  {src.name}: {dst} appeared while working (use --force to replace it)")
+                    continue
+                # Commit order: everything that can fail happens before dst is
+                # touched; the manifest is saved first, and rolled back if the
+                # final replace fails, so the image and its record stay in step.
                 archived = None
-                if dst.exists():
-                    if not args.force:
-                        print(f"SKIP  {src.name}: {dst} appeared while working (use --force to replace it)")
-                        continue
-                    archived = archive_replaced(dst, entries, hex_id)
-                output_sha = sha256_file(tmp)
-                replace_file(tmp, dst)
-                entries.append({
-                    "id": hex_id,
-                    "source": str(src.resolve()),
-                    "source_sha256": sha256_file(src),
-                    "output": str(dst),
-                    "output_sha256": output_sha,
-                    "width": marked.width,
-                    "height": marked.height,
-                    "visible_mark": None if args.no_visible else args.text,
-                    "headroom": args.headroom,
-                    "created": now_utc(),
-                })
-                save_manifest(entries)
+                try:
+                    new_entries = entries
+                    if dst.exists():
+                        archived, new_entries = archive_replaced(dst, entries, hex_id)
+                    row = {
+                        "id": hex_id,
+                        "source": str(src.resolve()),
+                        "source_sha256": sha256_file(src),
+                        "output": str(dst),
+                        "output_sha256": sha256_file(tmp),
+                        "width": marked.width,
+                        "height": marked.height,
+                        "visible_mark": None if args.no_visible else args.text,
+                        "headroom": args.headroom,
+                        "created": now_utc(),
+                    }
+                    public_file_mode(tmp, dst)
+                    save_manifest(new_entries + [row])
+                except OSError as exc:
+                    if archived:
+                        archived.unlink(missing_ok=True)
+                    failures += 1
+                    kept = f"{dst} left as it was" if dst.exists() else "no file written"
+                    print(f"FAIL  {src.name}: could not record it ({exc}). {kept}.")
+                    continue
+                try:
+                    replace_file(tmp, dst)
+                except OSError as exc:
+                    failures += 1
+                    try:
+                        save_manifest(entries)
+                        if archived:
+                            archived.unlink(missing_ok=True)
+                        print(f"FAIL  {src.name}: could not replace {dst} ({exc}). It was left as it was.")
+                    except OSError as exc2:
+                        print(f"FAIL  {src.name}: could not replace {dst} ({exc}), and could not undo the "
+                              f"manifest change ({exc2}). manifest.json lists id {hex_id} for {dst}, which "
+                              f"does not hold that copy yet."
+                              + (f" The old copy is also kept at {archived}." if archived else ""))
+                    continue
             used.add(hex_id)
             print(f"OK    {src.name} -> {dst}  id={hex_id}  readback {agree}/{ID_BITS}")
             if archived:
@@ -671,28 +748,63 @@ def best_match(bits, entries):
     return best
 
 
-def load_reference(entry, cache):
-    """Return (published image or None, note or None) for an entry, cached by path."""
-    path = entry.get("output")
-    if path in cache:
-        return cache[path]
-    ref, note = None, None
-    if not path or not os.path.exists(path):
-        note = f"published copy missing, skipped for alignment: {path}"
-    else:
+class ReferenceCache:
+    """Published copies used for alignment, loaded on demand.
+
+    Validation results (small) are kept for the whole run, keyed by path *and*
+    the size and hash the manifest row expects, so two rows that point at one
+    file are each checked against their own record. Decoded images are kept
+    only for the few most recently used paths, so memory doesn't grow with the
+    size of the library.
+    """
+
+    def __init__(self, limit=REF_CACHE_IMAGES):
+        self.limit = limit
+        self.checked = {}                        # key -> (usable, note)
+        self.images = collections.OrderedDict()  # path -> decoded RGB image
+
+    def _image(self, path):
+        if path in self.images:
+            self.images.move_to_end(path)
+            return self.images[path]
+        img, _ = open_image(path)
+        self.images[path] = img
+        while len(self.images) > self.limit:
+            self.images.popitem(last=False)
+        return img
+
+    def get(self, entry):
+        """Return (published image or None, note or None) for a manifest row."""
+        path = entry.get("output")
+        key = (path, entry.get("width"), entry.get("height"), entry.get("output_sha256"))
         try:
-            img, _ = open_image(path)
-            if img.size != (entry["width"], entry["height"]):
-                note = (f"{path} is {img.width}x{img.height} but was published at "
-                        f"{entry['width']}x{entry['height']}; skipped for alignment")
+            if key in self.checked:
+                usable, note = self.checked[key]
+                return (self._image(path) if usable else None), note
+            usable, note, img = False, None, None
+            if not path or not os.path.exists(path):
+                note = f"published copy missing, skipped for alignment: {path}"
             else:
-                ref = img
-                if entry.get("output_sha256") and sha256_file(path) != entry["output_sha256"]:
-                    note = f"{path} has changed since it was published; used for alignment only"
+                img = self._image(path)
+                if img.size != (entry["width"], entry["height"]):
+                    note = (f"{path} is {img.width}x{img.height} but was published at "
+                            f"{entry['width']}x{entry['height']}; skipped for alignment")
+                    img = None
+                else:
+                    usable = True
+                    if entry.get("output_sha256") and sha256_file(path) != entry["output_sha256"]:
+                        note = f"{path} has changed since it was published; used for alignment only"
+            self.checked[key] = (usable, note)
+            return img, note
         except Exception as exc:
             note = f"cannot read published copy {path} ({exc}); skipped for alignment"
-    cache[path] = (ref, note)
-    return cache[path]
+            self.checked[key] = (False, note)
+            return None, note
+
+
+def is_match(agree, comparisons):
+    """True when this result already earns a full MATCH, chance bound included."""
+    return verdict(agree, chance_of(agree, comparisons)) == "MATCH"
 
 
 def fit(img, size):
@@ -709,7 +821,7 @@ def cmd_check(args):
     if not entries:
         sys.exit(f"{manifest_file()} has no entries, so there is nothing to compare against.")
     sizes = sorted({(e["width"], e["height"]) for e in entries})
-    refs = {}
+    refs = ReferenceCache()
     found_any = False
 
     for path in map(Path, args.images):
@@ -724,7 +836,7 @@ def cmd_check(args):
         notes = []
 
         def reference(e):
-            ref, note = load_reference(e, refs)
+            ref, note = refs.get(e)
             if note and note not in notes:
                 notes.append(note)
             return ref
@@ -743,15 +855,21 @@ def cmd_check(args):
                 if agree > best[0]:
                     best = (agree, entry, f"{label}, scaled to {size[0]}x{size[1]}")
 
+        # The later passes run until the best result is a full MATCH (bits *and*
+        # chance bound), not merely 58 bits. Each published copy is loaded once
+        # and used for both flips before moving on, so few stay in memory.
+
         # Pass 1b: same, after undoing a brightness/contrast edit against each published copy.
-        if best[0] < MATCH_BITS:
-            for label, img in flips:
-                for e in entries:
-                    size = (e["width"], e["height"])
+        if not is_match(best[0], tries):
+            for e in entries:
+                size = (e["width"], e["height"])
+                if not any(same_aspect(img.size, size) for _, img in flips):
+                    continue
+                published = reference(e)
+                if published is None:
+                    continue
+                for label, img in flips:
                     if not same_aspect(img.size, size):
-                        continue
-                    published = reference(e)
-                    if published is None:
                         continue
                     cand = tone_match(published, fit(img, size))
                     if cand is None:
@@ -762,19 +880,19 @@ def cmd_check(args):
                         best = (agree, e, f"{label}, brightness/contrast undone against {Path(e['output']).name}")
 
         # Pass 2: undo cropping by locating the suspect inside each published copy.
-        if best[0] < MATCH_BITS and not args.no_crop_search:
-            for label, img in flips:
-                for e in entries:
-                    published = reference(e)
-                    if published is None:
-                        continue
+        if not is_match(best[0], tries) and not args.no_crop_search:
+            for e in entries:
+                published = reference(e)
+                if published is None:
+                    continue
+                for label, img in flips:
                     restored, _score, box = realign_crop(published, img)
                     if restored is None:
                         continue
                     agree = agreement(extract_bits(restored, key), e["id"])
                     tries += 1
                     how = f"{label}, re-aligned as a crop of {Path(e['output']).name}"
-                    if agree < MATCH_BITS:
+                    if not is_match(agree, tries):
                         # Cropped and tone-edited: fit tone on the overlapping area only.
                         fixed = tone_match(published.crop(box), restored.crop(box))
                         if fixed is not None:

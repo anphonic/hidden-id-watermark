@@ -350,6 +350,138 @@ class InProcess(unittest.TestCase):
         b = Image.new("RGB", (80, 100))
         self.assertIsNone(self.mod.tone_match(a, b))
 
+    def _embedded(self, name="pic.png", seed=11):
+        src = self.root / "originals" / name
+        make_test_image(src, seed=seed)
+        code, log = self.run_main("embed", src, "--out", self.out, "--owner", "T", "--no-visible")
+        self.assertEqual(code, 0, log)
+        return src, self.out / name
+
+    def _archive_files(self):
+        a = self.mod.HERE / "archive"
+        return sorted(p.name for p in a.iterdir()) if a.exists() else []
+
+    @unittest.skipIf(os.name == "nt", "POSIX permission bits")
+    def test_published_copy_gets_normal_permissions(self):
+        old = os.umask(0o022)
+        try:
+            src, dst = self._embedded()
+            self.assertEqual(dst.stat().st_mode & 0o777, 0o644)
+            os.chmod(dst, 0o640)
+            code, log = self.run_main("embed", src, "--out", self.out, "--owner", "T", "--no-visible", "--force")
+            self.assertEqual(code, 0, log)
+            self.assertEqual(dst.stat().st_mode & 0o777, 0o640)
+        finally:
+            os.umask(old)
+
+    def test_key_not_written_when_it_cannot_be_restricted(self):
+        src = self.root / "originals" / "pic.png"
+        make_test_image(src, seed=11)
+        with mock.patch.object(self.mod, "restrict_to_owner", side_effect=OSError("denied")):
+            with self.assertRaises(SystemExit) as cm:
+                self.run_main("embed", src, "--out", self.out, "--owner", "T")
+        self.assertIn("No key was written", str(cm.exception.code))
+        self.assertEqual([p.name for p in self.mod.HERE.iterdir() if p.name != ".watermark.lock"], [])
+
+    def test_key_is_restricted_while_still_empty(self):
+        sizes = []
+        real = self.mod.restrict_to_owner
+
+        def spy(path):
+            sizes.append(os.path.getsize(path))
+            real(path)
+        with mock.patch.object(self.mod, "restrict_to_owner", side_effect=spy):
+            self.mod.load_key(create=True)
+        self.assertEqual(sizes, [0])
+        self.assertTrue(self.mod.key_file().exists())
+
+    def test_archive_names_never_collide(self):
+        a, b = self.root / "a", self.root / "b"
+        a.mkdir()
+        b.mkdir()
+        (a / "x.png").write_bytes(b"first")
+        (b / "x.png").write_bytes(b"second")
+        with mock.patch.object(self.mod, "now_utc", return_value="t"):
+            t1, _ = self.mod.archive_replaced(a / "x.png", [], "1" * 16)
+            t2, _ = self.mod.archive_replaced(b / "x.png", [], "2" * 16)
+            t3, _ = self.mod.archive_replaced(a / "x.png", [], "3" * 16)
+        self.assertEqual(len({t1, t2, t3}), 3)
+        self.assertEqual(t1.read_bytes(), b"first")
+        self.assertEqual(t2.read_bytes(), b"second")
+
+    def test_tracked_archive_name_is_not_reused(self):
+        dst = self.root / "x.png"
+        dst.write_bytes(b"new")
+        rows = [{"id": "ab" * 8, "output": str(dst)}]
+        (self.mod.HERE / "archive").mkdir()
+        existing = self.mod.HERE / "archive" / ("ab" * 8 + ".png")
+        existing.write_bytes(b"old")
+        target, updated = self.mod.archive_replaced(dst, rows, "cd" * 8)
+        self.assertNotEqual(target, existing)
+        self.assertEqual(existing.read_bytes(), b"old")
+        self.assertNotIn("superseded", rows[0])            # caller's list is untouched
+        self.assertEqual(updated[0]["output"], str(target))
+
+    def test_manifest_save_failure_leaves_old_copy_in_place(self):
+        src, dst = self._embedded()
+        before_file, before_manifest = sha(dst), (self.mod.HERE / "manifest.json").read_text()
+        with mock.patch.object(self.mod, "save_manifest", side_effect=OSError("disk full")):
+            code, log = self.run_main("embed", src, "--out", self.out, "--owner", "T", "--no-visible", "--force")
+        self.assertEqual(code, 1, log)
+        self.assertIn("could not record it", log)
+        self.assertEqual(sha(dst), before_file)
+        self.assertEqual((self.mod.HERE / "manifest.json").read_text(), before_manifest)
+        self.assertEqual(self._archive_files(), [])
+        self.assertEqual([p.name for p in self.out.iterdir()], ["pic.png"])
+
+    def test_replace_failure_rolls_back_manifest(self):
+        src, dst = self._embedded()
+        before_file, before_manifest = sha(dst), (self.mod.HERE / "manifest.json").read_text()
+        real = self.mod.replace_file
+
+        def failing(a, b):
+            if Path(b) == dst:
+                raise PermissionError("locked")
+            real(a, b)
+        with mock.patch.object(self.mod, "replace_file", side_effect=failing):
+            code, log = self.run_main("embed", src, "--out", self.out, "--owner", "T", "--no-visible", "--force")
+        self.assertEqual(code, 1, log)
+        self.assertIn("It was left as it was", log)
+        self.assertEqual(sha(dst), before_file)
+        self.assertEqual(json.loads((self.mod.HERE / "manifest.json").read_text()), json.loads(before_manifest))
+        self.assertEqual(self._archive_files(), [])
+
+    def test_reference_cache_is_bounded(self):
+        rows = []
+        for i in range(6):
+            p = self.root / f"ref{i}.png"
+            make_test_image(p, w=300, h=260, seed=30 + i)
+            rows.append({"output": str(p), "width": 300, "height": 260, "output_sha256": sha(p)})
+        cache = self.mod.ReferenceCache(limit=2)
+        for _ in range(2):
+            for r in rows:
+                img, note = cache.get(r)
+                self.assertIsNotNone(img)
+                self.assertIsNone(note)
+                self.assertLessEqual(len(cache.images), 2)
+
+    def test_reference_cache_checks_each_row_on_its_own(self):
+        p = self.root / "ref.png"
+        make_test_image(p, w=300, h=260, seed=40)
+        good = {"output": str(p), "width": 300, "height": 260, "output_sha256": sha(p)}
+        wrong = dict(good, width=999, height=777)
+        for order in ((wrong, good), (good, wrong)):
+            cache = self.mod.ReferenceCache()
+            results = {id(r): cache.get(r) for r in order}
+            self.assertIsNotNone(results[id(good)][0])
+            self.assertIsNone(results[id(wrong)][0])
+            self.assertIn("skipped for alignment", results[id(wrong)][1])
+
+    def test_search_gates_use_full_match_rule(self):
+        self.assertTrue(self.mod.is_match(58, 1))
+        self.assertFalse(self.mod.is_match(58, 10 ** 6))   # enough bits, chance bound too big
+        self.assertTrue(self.mod.is_match(64, 10 ** 6))
+
     def _picture(self):
         p = self.root / "originals" / "ref.png"
         make_test_image(p, seed=13)

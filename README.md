@@ -38,7 +38,13 @@ differently, and then IDs embedded with this version may stop matching.
   destroys a good copy.
 - `--force` replaces an existing copy. The old copy moves to `archive/` in the
   state folder and its manifest row is kept (marked `superseded`), so copies of
-  it that are already out in the world still match.
+  it that are already out in the world still match. Archive names are never
+  reused, so one archived copy can't overwrite another.
+- The manifest is saved before the new copy replaces the old one. If the
+  replace fails, the manifest change is undone, so a file and its record never
+  drift apart.
+- Published copies get normal file permissions (on Linux and macOS, the mode of
+  the copy they replace, or 0666 minus your umask), so a web server can read them.
 - Exit code: `0` if no image failed, `1` if any did. Skipped images aren't failures.
 - Useful options: `--text` (default `© <owner>`), `--opacity 0.16`, `--no-visible`,
   `--max-size 1600`, `--quality 92`, `--font path/to/font.ttf`, `--force`.

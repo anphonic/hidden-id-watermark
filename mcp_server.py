@@ -17,7 +17,9 @@ command line uses (beside watermark.py, or WATERMARK_DIR).
 
 import asyncio
 import os
+import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 from typing import Annotated
@@ -30,6 +32,9 @@ from pydantic import Field  # noqa: E402
 
 SCRIPT = Path(__file__).resolve().parent / "watermark.py"
 HEARTBEAT_SECONDS = 10
+POLL_SECONDS = 0.1
+DETACHED = ({"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP} if os.name == "nt"
+            else {"start_new_session": True})
 
 mcp = FastMCP(
     name="hidden-id-watermark",
@@ -49,37 +54,49 @@ def absolute(paths):
 
 
 async def run_watermark(args, ctx, kill_on_cancel):
-    """Run watermark.py, sending a progress note every few seconds while it works."""
-    proc = await asyncio.create_subprocess_exec(
-        sys.executable, str(SCRIPT), *args,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-        env={**os.environ, "PYTHONIOENCODING": "utf-8"},
-    )
-    started = time.monotonic()
-    done = asyncio.ensure_future(proc.communicate())
-    try:
-        while True:
-            finished, _ = await asyncio.wait({done}, timeout=HEARTBEAT_SECONDS)
-            if finished:
-                break
-            elapsed = int(time.monotonic() - started)
-            await ctx.report_progress(elapsed, None, f"still working ({elapsed} s)")
-    except BaseException:
-        # Cancelled or failed. A check only reads, so stop it rather than leave
-        # a crop search running. An embed is left to finish: killing it between
-        # the manifest save and the file replace would split a file from its row.
-        if kill_on_cancel and proc.returncode is None:
-            proc.kill()
-            done.cancel()
-        raise
-    out, err = done.result()
-    return {
-        "exit_code": proc.returncode,
-        "report": out.decode("utf-8", "replace").strip(),
-        "errors": err.decode("utf-8", "replace").strip(),
-        "seconds": round(time.monotonic() - started, 1),
-    }
+    """Run watermark.py, sending a progress note every few seconds while it works.
+
+    The child writes its report to temporary files, not pipes, and reads nothing
+    from stdin (which is the MCP connection). So a child that outlives this call,
+    or this server, can still write its output and finish. It is a plain Popen,
+    not an asyncio subprocess, because asyncio kills a child that is still
+    running when its transport is cleaned up.
+    """
+    with tempfile.TemporaryFile() as out_f, tempfile.TemporaryFile() as err_f:
+        proc = subprocess.Popen(
+            [sys.executable, str(SCRIPT), *args],
+            stdin=subprocess.DEVNULL, stdout=out_f, stderr=err_f,
+            env={**os.environ, "PYTHONIOENCODING": "utf-8"},
+            # An embed gets its own session or process group, so a signal sent
+            # to the server's group (Ctrl+C, the client stopping it) doesn't reach it.
+            **({} if kill_on_cancel else DETACHED),
+        )
+        started = time.monotonic()
+        next_note = started + HEARTBEAT_SECONDS
+        try:
+            while proc.poll() is None:
+                await asyncio.sleep(POLL_SECONDS)
+                now = time.monotonic()
+                if now >= next_note:
+                    elapsed = int(now - started)
+                    await ctx.report_progress(elapsed, None, f"still working ({elapsed} s)")
+                    next_note = now + HEARTBEAT_SECONDS
+        except BaseException:
+            # Cancelled or failed. A check only reads, so stop it rather than leave
+            # a crop search running. An embed is left to finish: killing it between
+            # the manifest save and the file replace would split a file from its row.
+            if kill_on_cancel and proc.poll() is None:
+                proc.kill()
+                proc.wait()
+            raise
+        out_f.seek(0)
+        err_f.seek(0)
+        return {
+            "exit_code": proc.returncode,
+            "report": out_f.read().decode("utf-8", "replace").strip(),
+            "errors": err_f.read().decode("utf-8", "replace").strip(),
+            "seconds": round(time.monotonic() - started, 1),
+        }
 
 
 @mcp.tool(annotations={"title": "Check suspect images", "read_only_hint": True, "open_world_hint": False})
@@ -102,7 +119,7 @@ async def check_image(
 
 
 @mcp.tool(annotations={"title": "Watermark images", "read_only_hint": False,
-                       "destructive_hint": False, "open_world_hint": False})
+                       "destructive_hint": True, "open_world_hint": False})
 async def watermark_images(
     inputs: Annotated[list[str], Field(min_length=1, description="Image files or folders of images.")],
     out: Annotated[str, Field(description="Folder for the watermarked copies. Must not hold any input.")],
@@ -154,11 +171,13 @@ def list_watermarked(
     if contains:
         needle = contains.lower()
         rows = [r for r in rows if needle in r.get("output", "").lower() or needle in r.get("source", "").lower()]
-    rows.sort(key=lambda r: r.get("created", ""), reverse=True)
+    # Timestamps have one-second precision and rows are appended, so break ties
+    # by position: a later row is newer.
+    order = sorted(range(len(rows)), key=lambda i: (rows[i].get("created", ""), i), reverse=True)
     keep = ("id", "output", "source", "created", "width", "height", "superseded", "superseded_by")
     return {
         "total": len(rows),
-        "rows": [{k: r[k] for k in keep if k in r} for r in rows[:limit]],
+        "rows": [{k: rows[i][k] for k in keep if k in rows[i]} for i in order[:limit]],
     }
 
 

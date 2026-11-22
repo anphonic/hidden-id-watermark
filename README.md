@@ -129,8 +129,8 @@ Then point any MCP client at `.venv/bin/python /full/path/to/mcp_server.py`.
 A crop search can take several minutes with a large manifest. The server sends a
 progress note every 10 seconds while it works. If your client still times out,
 raise its tool timeout (in Claude Code, set `MCP_TOOL_TIMEOUT` in milliseconds).
-Cancelling a check stops it. Cancelling a watermark run lets it finish, so a file
-and its manifest row never split.
+Cancelling a check stops it. Cancelling a watermark run lets it finish, even if the
+assistant then closes, so a file and its manifest row never split.
 
 ### Claude Code plugin
 

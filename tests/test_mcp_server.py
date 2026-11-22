@@ -80,6 +80,7 @@ class McpServer(unittest.TestCase):
         self.assertTrue(tools["check_image"].annotations.read_only_hint)
         self.assertTrue(tools["list_watermarked"].annotations.read_only_hint)
         self.assertFalse(tools["watermark_images"].annotations.read_only_hint)
+        self.assertTrue(tools["watermark_images"].annotations.destructive_hint)  # force replaces files
 
     def test_3_embed_then_list_then_check(self):
         res = self.embed().structured_content
@@ -127,6 +128,15 @@ class McpServer(unittest.TestCase):
             self.call("check_image", {"paths": [str(self.out / "picture.png")]}, progress_handler=on_progress)
         self.assertTrue(any("still working" in (m or "") for m in seen), seen)
 
+    def test_8_same_second_rows_list_newest_first(self):
+        self.call("list_watermarked", {})  # makes sure the server has imported watermark
+        rows = [{"id": "first", "created": "2026-11-22T10:00:00+00:00", "output": "a.png"},
+                {"id": "second", "created": "2026-11-22T10:00:00+00:00", "output": "b.png"},
+                {"id": "older", "created": "2026-11-21T10:00:00+00:00", "output": "c.png"}]
+        with mock.patch.object(sys.modules["watermark"], "load_manifest", return_value=rows):
+            res = self.call("list_watermarked", {"limit": 2}).structured_content
+        self.assertEqual([r["id"] for r in res["rows"]], ["second", "first"])
+
 
 class Paths(unittest.TestCase):
 
@@ -142,31 +152,47 @@ class Paths(unittest.TestCase):
 class Cancelling(unittest.TestCase):
     """A cancelled check stops its child process; a cancelled embed is left to finish."""
 
-    def run_and_cancel(self, kill_on_cancel):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.dir = Path(self.tmp.name)
+        self.finished = self.dir / "finished"
+
+    def run_and_cancel(self, kill_on_cancel, work_seconds=60):
+        """Start a fake watermark.py, cancel the call, and close the event loop (the server going away).
+
+        The fake waits, then writes more output than a pipe buffer holds, then
+        marks itself finished, the way an embed writes its report at the end.
+        """
         server = load_server()
-        with tempfile.TemporaryDirectory() as d:
-            pid_file = Path(d) / "pid"
-            fake = Path(d) / "fake.py"
-            fake.write_text(f"import os, time\nopen({str(pid_file)!r}, 'w').write(str(os.getpid()))\ntime.sleep(60)\n")
+        pid_file = self.dir / "pid"
+        fake = self.dir / "fake.py"
+        fake.write_text(
+            "import os, sys, time\n"
+            f"open({str(pid_file)!r}, 'w').write(str(os.getpid()))\n"
+            f"time.sleep({work_seconds})\n"
+            "sys.stdout.write('x' * 300_000)\n"
+            "sys.stdout.flush()\n"
+            f"open({str(self.finished)!r}, 'w').write('ok')\n")
 
-            class Ctx:
-                async def report_progress(self, *a):
-                    pass
+        class Ctx:
+            async def report_progress(self, *a):
+                pass
 
-            async def go():
-                task = asyncio.ensure_future(server.run_watermark([], Ctx(), kill_on_cancel=kill_on_cancel))
-                for _ in range(200):
-                    if pid_file.exists() and pid_file.read_text():
-                        break
-                    await asyncio.sleep(0.05)
-                task.cancel()
-                with self.assertRaises(asyncio.CancelledError):
-                    await task
-                return int(pid_file.read_text())
+        async def go():
+            task = asyncio.ensure_future(server.run_watermark([], Ctx(), kill_on_cancel=kill_on_cancel))
+            for _ in range(200):
+                if pid_file.exists() and pid_file.read_text():
+                    break
+                await asyncio.sleep(0.05)
+            task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+            return int(pid_file.read_text())
 
-            with mock.patch.object(server, "SCRIPT", fake):
-                pid = asyncio.run(go())
-            return pid
+        with mock.patch.object(server, "SCRIPT", fake):
+            pid = asyncio.run(go())
+        return pid
 
     @staticmethod
     def alive(pid):
@@ -188,12 +214,17 @@ class Cancelling(unittest.TestCase):
             time.sleep(0.05)
         self.assertFalse(self.alive(pid))
 
-    def test_cancelled_embed_keeps_running(self):
-        pid = self.run_and_cancel(kill_on_cancel=False)
+    def test_cancelled_embed_finishes_after_the_server_is_gone(self):
+        pid = self.run_and_cancel(kill_on_cancel=False, work_seconds=1)
         try:
-            self.assertTrue(self.alive(pid))
+            for _ in range(200):
+                if self.finished.exists():
+                    break
+                time.sleep(0.05)
+            self.assertTrue(self.finished.exists(), "the cancelled embed did not finish")
         finally:
-            os.kill(pid, 9)
+            if self.alive(pid):
+                os.kill(pid, 9)
 
 
 if __name__ == "__main__":

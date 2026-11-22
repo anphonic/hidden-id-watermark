@@ -1,0 +1,10 @@
+{
+  "name": "hidden-id-watermark",
+  "version": "0.1.0",
+  "description": "Watermark images with a hidden 64-bit ID and check suspect copies, through a local MCP server.",
+  "author": {
+    "name": "anphonic"
+  },
+  "repository": "https://github.com/anphonic/hidden-id-watermark",
+  "license": "MIT"
+}

@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "hidden-id-watermark": {
+      "command": "${WATERMARK_PYTHON}",
+      "args": ["${WATERMARK_HOME}/mcp_server.py"]
+    }
+  }
+}

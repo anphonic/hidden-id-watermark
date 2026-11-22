@@ -103,6 +103,60 @@ calibrated on a large set of real crops.
 
 The exit code is `0` if any image matched and `1` if none did.
 
+## Use it from an AI assistant (MCP)
+
+`mcp_server.py` is a small [MCP](https://modelcontextprotocol.io) server, so an
+assistant such as Claude Code can watermark and check images for you. It has three tools:
+
+| Tool | What it does |
+|---|---|
+| `check_image` | runs `check` on suspect images and returns the report, plus `matched` |
+| `watermark_images` | runs `embed` and returns the report, plus `ok` |
+| `list_watermarked` | lists the manifest's rows (ID, file paths, date), newest first |
+
+It runs over stdio on your own machine and calls `watermark.py` in a child process,
+so it uses the same state folder as the command line. The key is never sent to the
+assistant. Only the reports are. Don't expose this server over a network.
+
+Install its extra dependency into the same venv:
+
+```bash
+.venv/bin/pip install -r requirements-mcp.txt
+```
+
+Then point any MCP client at `.venv/bin/python /full/path/to/mcp_server.py`.
+
+A crop search can take several minutes with a large manifest. The server sends a
+progress note every 10 seconds while it works. If your client still times out,
+raise its tool timeout (in Claude Code, set `MCP_TOOL_TIMEOUT` in milliseconds).
+Cancelling a check stops it. Cancelling a watermark run lets it finish, even if the
+assistant then closes, so a file and its manifest row never split.
+
+### Claude Code plugin
+
+The plugin adds the server plus two skills: `/hidden-id-watermark:check-image` and
+`/hidden-id-watermark:watermark-images`.
+
+```
+/plugin install hidden-id-watermark --marketplace anphonic/hidden-id-watermark
+```
+
+The plugin doesn't carry its own copy of the tool, because your key would end up in
+the plugin cache. It runs your install, which you name with two environment variables. Set
+them in `~/.claude/settings.json`:
+
+```json
+{
+  "env": {
+    "WATERMARK_HOME": "/full/path/to/hidden-id-watermark",
+    "WATERMARK_PYTHON": "/full/path/to/hidden-id-watermark/.venv/bin/python"
+  }
+}
+```
+
+On Windows, `WATERMARK_PYTHON` is `...\.venv\Scripts\python.exe`. Add
+`WATERMARK_DIR` too if your state folder isn't beside `watermark.py`.
+
 ## Your private files
 
 The tool keeps its state beside `watermark.py`. Set `WATERMARK_DIR` to keep it
@@ -132,6 +186,7 @@ show that you made it first.
 ```
 
 The tests run in a throwaway `WATERMARK_DIR`, so they never touch your real key.
+The MCP server's tests are skipped unless `requirements-mcp.txt` is installed.
 
 ## Limits
 
